@@ -1,314 +1,421 @@
 """
-app.py
-Main Streamlit application for Indian Sign Language (ISL) Recognition & Translation
-Powered by a 1D Convolutional Neural Network (CNN) and MediaPipe Hands.
+Indian Sign Language Recognition & Translation
+Streamlit app with safe, lazy model loading for Streamlit Community Cloud.
 """
 
-import os
-import io
-import time
+from pathlib import Path
+import json
 import pickle
+import html
 import numpy as np
-from PIL import Image
 import streamlit as st
+from PIL import Image
+
+# Resolve paths relative to this app.py, not the process working directory.
+BASE_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = BASE_DIR / "assets"
+MODELS_DIR = BASE_DIR / "models"
+MODEL_PATH = MODELS_DIR / "isl_model.pkl"
+ENCODER_PATH = MODELS_DIR / "label_encoder.pkl"
 
 st.set_page_config(
     page_title="ISL Recognition & Translation",
     page_icon="🤟",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-# Custom Styling
-st.markdown("""
-<style>
+st.markdown(
+    """
+    <style>
     .header-card {
         background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
-        color: white;
-        padding: 22px;
-        border-radius: 12px;
-        margin-bottom: 20px;
+        color: white; padding: 22px; border-radius: 12px; margin-bottom: 20px;
     }
-    .header-title { font-size: 2.1rem; font-weight: 700; margin-bottom: 4px; }
-    .header-sub { font-size: 1rem; opacity: 0.9; }
+    .header-title { font-size: 2rem; font-weight: 700; margin-bottom: 4px; }
+    .header-sub { font-size: 1rem; opacity: .92; }
     .pred-box {
-        background-color: #f8f9fa;
-        border: 2px solid #e9ecef;
-        border-radius: 12px;
-        padding: 18px;
-        text-align: center;
-        margin: 12px 0;
+        background: #f8f9fa; border: 2px solid #e9ecef; border-radius: 12px;
+        padding: 18px; text-align: center; margin: 12px 0;
     }
-    .pred-label { font-size: 2.8rem; font-weight: 800; color: #1a73e8; }
+    .pred-label { font-size: 2.5rem; font-weight: 800; color: #1a73e8; }
     .sentence-container {
-        background: #ffffff;
-        border: 2px solid #e0e0e0;
-        border-radius: 8px;
-        padding: 14px 18px;
-        font-size: 1.3rem;
-        font-family: monospace;
-        min-height: 55px;
-        display: flex;
-        align-items: center;
+        background: #fff; border: 2px solid #e0e0e0; border-radius: 8px;
+        padding: 14px 18px; font-size: 1.2rem; font-family: monospace;
+        min-height: 55px; overflow-wrap: anywhere;
     }
     .sign-card {
-        border: 1px solid #e0e0e0;
-        border-radius: 8px;
-        padding: 10px;
-        text-align: center;
-        background: #ffffff;
+        border: 1px solid #e0e0e0; border-radius: 8px; padding: 10px;
+        text-align: center; background: #fff;
     }
-</style>
-""", unsafe_allow_html=True)
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-# Safe imports
+# Keep imports separate so a missing optional dependency does not prevent
+# the rest of the interface from rendering.
+MP_AVAILABLE = False
+extract_landmarks = None
+TOTAL_LANDMARK_FEATURES = 126
+preprocess_error = None
+
 try:
-    from src.preprocess import extract_landmarks, TOTAL_LANDMARK_FEATURES, MP_AVAILABLE
-except Exception:
-    MP_AVAILABLE = False
-    extract_landmarks = None
-    TOTAL_LANDMARK_FEATURES = 126
+    from src.preprocess import (
+        extract_landmarks,
+        TOTAL_LANDMARK_FEATURES,
+        MP_AVAILABLE,
+    )
+except Exception as exc:
+    preprocess_error = f"{type(exc).__name__}: {exc}"
 
+text_to_sign_sequence = None
+text_to_sign_error = None
+try:
+    from src.text_to_sign import text_to_sign_sequence
+except Exception as exc:
+    text_to_sign_error = f"{type(exc).__name__}: {exc}"
+
+ISLConvNet = None
+train_and_save = None
+DEFAULT_CLASSES = [
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J",
+    "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T",
+    "U", "V", "W", "X", "Y", "Z",
+    "1", "2", "3", "4", "5", "6", "7", "8", "9",
+    "HELLO", "THANK YOU", "YES", "NO", "PLEASE",
+]
+train_model_error = None
 try:
     from src.train_model import ISLConvNet, train_and_save, DEFAULT_CLASSES
-except Exception:
-    ISLConvNet = None
-    train_and_save = None
-    DEFAULT_CLASSES = [
-        'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J',
-        'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T',
-        'U', 'V', 'W', 'X', 'Y', 'Z',
-        '1', '2', '3', '4', '5', '6', '7', '8', '9',
-        'HELLO', 'THANK YOU', 'YES', 'NO', 'PLEASE'
-    ]
-
-try:
-    from src.text_to_sign import text_to_sign_sequence, create_sign_collage
-except Exception:
-    text_to_sign_sequence = None
-    create_sign_collage = None
-
-
-@st.cache_resource
-def load_or_init_model():
-    model_path = os.path.join("models", "isl_model.pkl")
-    encoder_path = os.path.join("models", "label_encoder.pkl")
-    
-    if os.path.exists(model_path) and os.path.exists(encoder_path):
-        try:
-            with open(model_path, "rb") as f:
-                model = pickle.load(f)
-            with open(encoder_path, "rb") as f:
-                label_encoder = pickle.load(f)
-            if hasattr(model, "predict_proba") and hasattr(label_encoder, "classes_"):
-                return model, label_encoder
-        except Exception:
-            pass
-
-    if train_and_save:
-        with st.spinner("Initializing ISL CNN model..."):
-            model, label_encoder = train_and_save()
-            return model, label_encoder
-    else:
-        from sklearn.preprocessing import LabelEncoder
-        le = LabelEncoder()
-        le.fit(DEFAULT_CLASSES)
-        m = ISLConvNet(num_classes=len(DEFAULT_CLASSES)) if ISLConvNet else None
-        return m, le
-
+except Exception as exc:
+    train_model_error = f"{type(exc).__name__}: {exc}"
 
 if "sentence" not in st.session_state:
     st.session_state.sentence = ""
 if "last_predicted" not in st.session_state:
     st.session_state.last_predicted = ""
+if "isl_model" not in st.session_state:
+    st.session_state.isl_model = None
+if "isl_encoder" not in st.session_state:
+    st.session_state.isl_encoder = None
+if "model_error" not in st.session_state:
+    st.session_state.model_error = None
+
+
+@st.cache_resource(show_spinner=False)
+def load_saved_model(model_file: str, encoder_file: str):
+    """Load only committed model artifacts. Never train during page startup."""
+    with open(model_file, "rb") as f:
+        model = pickle.load(f)
+    with open(encoder_file, "rb") as f:
+        encoder = pickle.load(f)
+    if not hasattr(model, "predict_proba"):
+        raise TypeError("Saved model does not provide predict_proba().")
+    if not hasattr(encoder, "classes_"):
+        raise TypeError("Saved label encoder does not provide classes_.")
+    return model, encoder
+
+
+def load_model_for_session():
+    """Load saved model on demand, with a clear message if artifacts are absent."""
+    if not MODEL_PATH.is_file() or not ENCODER_PATH.is_file():
+        missing = []
+        if not MODEL_PATH.is_file():
+            missing.append(str(MODEL_PATH.relative_to(BASE_DIR)))
+        if not ENCODER_PATH.is_file():
+            missing.append(str(ENCODER_PATH.relative_to(BASE_DIR)))
+        raise FileNotFoundError(
+            "Missing model file(s): " + ", ".join(missing)
+            + ". Add the trained model files to the repository, or train a model "
+              "locally and commit the generated files."
+        )
+    return load_saved_model(str(MODEL_PATH), str(ENCODER_PATH))
 
 
 def speak_via_browser(text):
-    if not text:
+    if not text.strip():
+        st.info("Add a sign to the sentence first.")
         return
-    clean = text.replace("'", "\\'").replace('"', '\\"').replace("\n", " ")
+    # json.dumps safely escapes quotes and newlines in the text.
+    text_json = json.dumps(text)
     speech_js = f"""
-    <script>
-        if ('speechSynthesis' in window) {{
-            window.speechSynthesis.cancel();
-            const utterance = new SpeechSynthesisUtterance('{clean}');
-            utterance.rate = 0.95;
-            utterance.lang = 'en-IN';
-            window.speechSynthesis.speak(utterance);
-        }}
-    </script>
+    const phrase = {text_json};
+    if ("speechSynthesis" in window) {{
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(phrase);
+        utterance.rate = 0.95;
+        utterance.lang = "en-IN";
+        window.speechSynthesis.speak(utterance);
+    }}
     """
     st.components.v1.html(speech_js, height=0)
 
 
-model, label_encoder = load_or_init_model()
-classes = list(label_encoder.classes_) if label_encoder and hasattr(label_encoder, 'classes_') else DEFAULT_CLASSES
+# Header is rendered before model loading so the app remains responsive.
+st.markdown(
+    """
+    <div class="header-card">
+      <div class="header-title">🇮🇳 Indian Sign Language Recognition &amp; Translation</div>
+      <div class="header-sub">Hand-gesture recognition, text-to-sign references, and sign dictionary</div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-
-# --- SIDEBAR ---
 with st.sidebar:
     st.title("🤟 ISL Classifier")
-    st.markdown("Convolutional Neural Network for Indian Sign Language.")
+    st.write("Indian Sign Language recognition and translation.")
     st.divider()
-    st.markdown(f"**Vocab Size**: `{len(classes)}` signs")
-    st.markdown(f"**MediaPipe**: `{'Active' if MP_AVAILABLE else 'Headless'}`")
-    st.markdown("**Dual Hands**: Supported (up to 2)")
-    conf_threshold = st.slider("Confidence Threshold", 0.30, 0.95, 0.60, 0.05)
+    st.caption(f"Python files directory: `{BASE_DIR.name}`")
+    st.caption(f"MediaPipe import: {'Available' if MP_AVAILABLE else 'Unavailable'}")
+    if preprocess_error:
+        with st.expander("Preprocessing import details"):
+            st.code(preprocess_error)
+    if train_model_error:
+        with st.expander("Model module import details"):
+            st.code(train_model_error)
+    if st.button("Load trained model", type="primary", use_container_width=True):
+        try:
+            with st.spinner("Loading trained model files..."):
+                st.session_state.isl_model, st.session_state.isl_encoder = load_model_for_session()
+                st.session_state.model_error = None
+            st.success("Model loaded.")
+        except Exception as exc:
+            st.session_state.isl_model = None
+            st.session_state.isl_encoder = None
+            st.session_state.model_error = f"{type(exc).__name__}: {exc}"
 
+model = st.session_state.isl_model
+label_encoder = st.session_state.isl_encoder
+classes = (
+    list(label_encoder.classes_)
+    if label_encoder is not None and hasattr(label_encoder, "classes_")
+    else list(DEFAULT_CLASSES)
+)
 
-# --- HEADER ---
-st.markdown("""
-<div class="header-card">
-    <div class="header-title">🇮🇳 Indian Sign Language Recognition & Translation</div>
-    <div class="header-sub">
-        Real-time two-handed gesture recognition with Deep CNN & MediaPipe
-    </div>
-</div>
-""", unsafe_allow_html=True)
+if st.session_state.model_error:
+    st.error("The trained model could not be loaded.")
+    st.code(st.session_state.model_error)
+elif model is None:
+    st.info(
+        "The interface is ready. Click **Load trained model** in the sidebar "
+        "to enable gesture predictions. Model loading is intentionally delayed "
+        "so it cannot block the initial page render."
+    )
 
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["📷 Recognition", "✍️ Text to Sign", "📖 Sign Dictionary", "🧠 CNN Architecture"]
+)
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📷 Real-Time Recognition",
-    "✍️ Text to Sign",
-    "📖 Sign Dictionary",
-    "🧠 CNN Architecture"
-])
-
-# TAB 1: RECOGNITION
 with tab1:
     col_in, col_out = st.columns([1.1, 0.9])
     with col_in:
-        mode = st.radio("Input Source:", ["📸 Camera Snapshot", "📁 Upload Image", "🧪 Test Sample Signs"], horizontal=True)
+        mode = st.radio(
+            "Input source:",
+            ["📸 Camera Snapshot", "📁 Upload Image", "🧪 Test Sample Signs"],
+            horizontal=True,
+        )
         img_to_process = None
 
         if mode == "📸 Camera Snapshot":
-            cam = st.camera_input("Take a snapshot of your hand gesture:")
-            if cam:
-                img_to_process = Image.open(cam)
+            cam = st.camera_input("Take a snapshot of your hand gesture")
+            if cam is not None:
+                try:
+                    img_to_process = Image.open(cam).convert("RGB")
+                except Exception as exc:
+                    st.error(f"Could not read the camera image: {exc}")
         elif mode == "📁 Upload Image":
-            up = st.file_uploader("Upload hand gesture image", type=["jpg", "png", "jpeg"])
-            if up:
-                img_to_process = Image.open(up)
+            up = st.file_uploader("Upload a hand gesture image", type=["jpg", "jpeg", "png"])
+            if up is not None:
+                try:
+                    img_to_process = Image.open(up).convert("RGB")
+                except Exception as exc:
+                    st.error(f"Could not read the uploaded image: {exc}")
         else:
             sample_class = st.selectbox("Select sample ISL sign:", classes)
-            real_sample = os.path.join("assets", "signs", "samples", f"{sample_class}.jpg")
-            card_sample = os.path.join("assets", "signs", f"{sample_class}.png")
-            if os.path.exists(real_sample):
-                img_to_process = Image.open(real_sample)
-                st.info(f"Loaded real dataset image for sign '{sample_class}'.")
-            elif os.path.exists(card_sample):
-                img_to_process = Image.open(card_sample)
-                st.info(f"Loaded reference card for '{sample_class}'.")
+            sample_paths = [
+                ASSETS_DIR / "signs" / "samples" / f"{sample_class}.jpg",
+                ASSETS_DIR / "signs" / f"{sample_class}.png",
+            ]
+            sample_path = next((p for p in sample_paths if p.is_file()), None)
+            if sample_path:
+                try:
+                    img_to_process = Image.open(sample_path).convert("RGB")
+                    st.info(f"Loaded reference image for '{sample_class}'.")
+                except Exception as exc:
+                    st.error(f"Could not read sample image: {exc}")
+            else:
+                st.info(f"No sample image found for '{sample_class}'. You can upload one instead.")
 
     with col_out:
-        st.markdown("#### Recognition Output")
-        if img_to_process is not None:
-            img_np = np.array(img_to_process.convert("RGB"))
-            bgr_img = img_np[:, :, ::-1].copy()
-
-            if extract_landmarks:
-                features, annotated_bgr, hands_count = extract_landmarks(bgr_img, draw_landmarks=True)
-                display_img = annotated_bgr[:, :, ::-1]
-            else:
-                features = np.zeros(TOTAL_LANDMARK_FEATURES, dtype=np.float32)
-                display_img = img_np
-                hands_count = 1
-
-            st.image(display_img, caption=f"Identified Hands: {hands_count}", use_container_width=True)
-
-            if model:
-                probs = model.predict_proba(features.reshape(1, -1))[0]
-                top_idx = int(np.argmax(probs))
-                conf = float(probs[top_idx])
-                pred = classes[top_idx]
-
-                if conf >= conf_threshold:
-                    st.session_state.last_predicted = pred
-                    st.markdown(f"""
-                    <div class="pred-box">
-                        <div class="pred-label">{pred}</div>
-                        <div>Confidence: <b>{conf * 100:.1f}%</b></div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    st.progress(min(conf, 1.0))
-                else:
-                    st.warning(f"Low confidence ({conf*100:.1f}%). Adjust hand posture.")
-
-                st.markdown("**Top Predictions:**")
-                for rank, idx in enumerate(np.argsort(probs)[-3:][::-1]):
-                    st.write(f"{rank + 1}. **{classes[idx]}**: `{probs[idx]*100:.1f}%`")
+        st.markdown("#### Recognition output")
+        if img_to_process is None:
+            st.info("Take a snapshot, upload an image, or choose a sample sign.")
         else:
-            st.info("Take a photo or choose a sample to detect signs.")
+            st.image(img_to_process, caption="Input image", use_container_width=True)
+            if model is None:
+                st.warning("Load a trained model from the sidebar to predict this sign.")
+            elif extract_landmarks is None or not MP_AVAILABLE:
+                st.error(
+                    "Landmark extraction is unavailable. Check the MediaPipe installation "
+                    "and the import details in the sidebar."
+                )
+            else:
+                try:
+                    rgb = np.asarray(img_to_process.convert("RGB"))
+                    bgr = rgb[:, :, ::-1].copy()
+                    features, annotated_bgr, hands_count = extract_landmarks(
+                        bgr, draw_landmarks=True
+                    )
+                    if features is None:
+                        st.warning("No hand landmarks were detected. Try a clearer image.")
+                    else:
+                        features = np.asarray(features, dtype=np.float32).reshape(1, -1)
+                        expected = getattr(model, "n_features_in_", features.shape[1])
+                        if features.shape[1] != expected:
+                            st.error(
+                                f"Model expects {expected} features, but preprocessing returned "
+                                f"{features.shape[1]}. The model and preprocessing code must match."
+                            )
+                        else:
+                            if annotated_bgr is not None:
+                                st.image(
+                                    np.asarray(annotated_bgr)[:, :, ::-1],
+                                    caption=f"Detected hands: {hands_count}",
+                                    use_container_width=True,
+                                )
+                            probs = model.predict_proba(features)[0]
+                            top_idx = int(np.argmax(probs))
+                            confidence = float(probs[top_idx])
+                            prediction = classes[top_idx] if top_idx < len(classes) else str(top_idx)
+                            st.markdown(
+                                f'<div class="pred-box"><div class="pred-label">'
+                                f'{html.escape(str(prediction))}</div>'
+                                f'<div>Confidence: <b>{confidence * 100:.1f}%</b></div></div>',
+                                unsafe_allow_html=True,
+                            )
+                            st.progress(float(np.clip(confidence, 0, 1)))
+                            st.session_state.last_predicted = str(prediction)
+                            st.markdown("**Top predictions**")
+                            for rank, idx in enumerate(np.argsort(probs)[-3:][::-1], start=1):
+                                name = classes[idx] if idx < len(classes) else str(idx)
+                                st.write(f"{rank}. **{name}** — {probs[idx] * 100:.1f}%")
+                except Exception as exc:
+                    st.error("Prediction failed. Check the preprocessing/model compatibility.")
+                    st.exception(exc)
 
     st.divider()
-    st.markdown("### 💬 Sentence Builder")
-    col_s1, col_s2 = st.columns([1.5, 1])
-    with col_s1:
-        st.markdown(f'<div class="sentence-container">{st.session_state.sentence or "..."}</div>', unsafe_allow_html=True)
-    with col_s2:
-        c1, c2, c3, c4 = st.columns(4)
-        if c1.button("➕ Add"):
-            if st.session_state.last_predicted:
-                p = st.session_state.last_predicted
-                st.session_state.sentence += p if len(p) == 1 else f" {p} "
-                st.rerun()
-        if c2.button("␣ Space"):
-            st.session_state.sentence += " "
+    st.markdown("### 💬 Sentence builder")
+    st.markdown(
+        f'<div class="sentence-container">{html.escape(st.session_state.sentence or "...")}</div>',
+        unsafe_allow_html=True,
+    )
+    b1, b2, b3, b4, b5 = st.columns(5)
+    if b1.button("➕ Add sign", use_container_width=True):
+        if st.session_state.last_predicted:
+            token = st.session_state.last_predicted
+            if len(token) == 1:
+                st.session_state.sentence += token
+            else:
+                if st.session_state.sentence and not st.session_state.sentence.endswith(" "):
+                    st.session_state.sentence += " "
+                st.session_state.sentence += token
             st.rerun()
-        if c3.button("⌫ Del"):
-            st.session_state.sentence = st.session_state.sentence[:-1]
-            st.rerun()
-        if c4.button("🗑️ Clear"):
-            st.session_state.sentence = ""
-            st.rerun()
-
-    if st.button("🔊 Speak Sentence", type="primary"):
+        else:
+            st.warning("Make a prediction first.")
+    if b2.button("␣ Space", use_container_width=True):
+        st.session_state.sentence += " "
+        st.rerun()
+    if b3.button("⌫ Delete", use_container_width=True):
+        st.session_state.sentence = st.session_state.sentence[:-1]
+        st.rerun()
+    if b4.button("🗑️ Clear", use_container_width=True):
+        st.session_state.sentence = ""
+        st.rerun()
+    if b5.button("🔊 Speak", use_container_width=True):
         speak_via_browser(st.session_state.sentence)
 
-
-# TAB 2: TEXT TO SIGN
 with tab2:
-    st.markdown("### ✍️ Translate Text into Sign Language")
-    txt = st.text_input("Enter text:", value="HELLO ISL")
-    if txt and text_to_sign_sequence:
-        seq = text_to_sign_sequence(txt, assets_dir="assets/signs")
-        valid = [s for s in seq if s["type"] != "space"]
-        cols = st.columns(min(len(valid), 6) or 1)
-        for i, item in enumerate(valid[:12]):
-            with cols[i % len(cols)]:
-                if item["image_path"] and os.path.exists(item["image_path"]):
-                    st.image(item["image_path"], caption=item["token"], use_container_width=True)
-                else:
-                    st.markdown(f'<div class="sign-card"><h4>{item["token"]}</h4></div>', unsafe_allow_html=True)
+    st.markdown("### ✍️ Translate text into sign references")
+    text_input = st.text_input("Enter text:", value="HELLO ISL")
+    if text_to_sign_sequence is None:
+        st.warning("Text-to-sign module could not be imported.")
+        if text_to_sign_error:
+            st.code(text_to_sign_error)
+    elif text_input.strip():
+        try:
+            sequence = text_to_sign_sequence(
+                text_input, assets_dir=str(ASSETS_DIR / "signs")
+            )
+            valid_items = [item for item in sequence if item.get("type") != "space"]
+            if not valid_items:
+                st.info("No sign references were returned for this text.")
+            else:
+                cols = st.columns(min(len(valid_items), 6))
+                for i, item in enumerate(valid_items[:12]):
+                    with cols[i % len(cols)]:
+                        image_path = item.get("image_path")
+                        token = str(item.get("token", "Unknown"))
+                        if image_path:
+                            path = Path(image_path)
+                            if not path.is_absolute():
+                                path = BASE_DIR / path
+                            if path.is_file():
+                                st.image(str(path), caption=token, use_container_width=True)
+                            else:
+                                st.markdown(
+                                    f'<div class="sign-card"><h4>{html.escape(token)}</h4></div>',
+                                    unsafe_allow_html=True,
+                                )
+                        else:
+                            st.markdown(
+                                f'<div class="sign-card"><h4>{html.escape(token)}</h4></div>',
+                                unsafe_allow_html=True,
+                            )
+        except Exception as exc:
+            st.error("Text-to-sign translation failed.")
+            st.exception(exc)
 
-
-# TAB 3: DICTIONARY
 with tab3:
-    st.markdown("### 📖 ISL Sign Dictionary")
+    st.markdown("### 📖 ISL sign dictionary")
     cols_per_row = 6
-    for i in range(0, len(classes), cols_per_row):
-        batch = classes[i:i + cols_per_row]
+    for start in range(0, len(classes), cols_per_row):
+        batch = classes[start:start + cols_per_row]
         cols = st.columns(len(batch))
-        for col, c_name in zip(cols, batch):
+        for col, class_name in zip(cols, batch):
             with col:
-                card_path = os.path.join("assets", "signs", f"{c_name}.png")
-                if os.path.exists(card_path):
-                    st.image(card_path, caption=c_name, use_container_width=True)
+                card_path = ASSETS_DIR / "signs" / f"{class_name}.png"
+                if card_path.is_file():
+                    st.image(str(card_path), caption=class_name, use_container_width=True)
                 else:
-                    st.markdown(f'<div class="sign-card"><h3>{c_name}</h3></div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f'<div class="sign-card"><h3>{html.escape(str(class_name))}</h3></div>',
+                        unsafe_allow_html=True,
+                    )
 
-
-# TAB 4: CNN ARCHITECTURE
 with tab4:
-    st.markdown("### 🧠 1D Convolutional Neural Network (CNN)")
-    st.code("""
-Input (Batch, 42 joints, 3 coords) -> 126 Features
-Conv1D (32 filters, k=3) + ReLU + MaxPool(2)
-Conv1D (64 filters, k=3) + ReLU + MaxPool(2)
-Flatten (576 Features)
-Dense (128 units, ReLU) + Dropout(0.3)
-Dense Output (Softmax) -> Sign Probabilities
-    """, language="text")
-    metrics_path = os.path.join("assets", "training_metrics.png")
-    if os.path.exists(metrics_path):
-        st.image(metrics_path, caption="CNN Convergence Curves", use_container_width=True)
+    st.markdown("### 🧠 1D Convolutional Neural Network")
+    st.code(
+        """
+Input: (batch, 126 landmark features)
+Conv1D (32 filters, kernel=3) + ReLU + MaxPool
+Conv1D (64 filters, kernel=3) + ReLU + MaxPool
+Flatten
+Dense (128 units, ReLU) + Dropout
+Output: class probabilities
+        """.strip(),
+        language="text",
+    )
+    metrics_path = ASSETS_DIR / "training_metrics.png"
+    if metrics_path.is_file():
+        st.image(str(metrics_path), caption="Training metrics", use_container_width=True)
+
+with st.expander("Deployment diagnostics"):
+    st.write("App directory:", str(BASE_DIR))
+    st.write("Model file exists:", MODEL_PATH.is_file())
+    st.write("Label encoder exists:", ENCODER_PATH.is_file())
+    st.write("Preprocessing import successful:", extract_landmarks is not None)
+    st.write("MediaPipe available:", MP_AVAILABLE)
+    st.write("Text-to-sign import successful:", text_to_sign_sequence is not None)
+    st.write("Model module import successful:", ISLConvNet is not None)
