@@ -1,1 +1,0 @@
-Optional: place licensed ISL demonstration videos here if you later extend text-to-sign beyond alphabet spelling.

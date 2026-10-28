@@ -1,1 +1,0 @@
-Place verified ISL alphabet sign images here, named A.png, B.png, ..., Z.png. These are used by the Text → Sign tab. Ensure you have permission to redistribute the images and cite their source. If you do not add images, the app shows letter placeholders instead.
