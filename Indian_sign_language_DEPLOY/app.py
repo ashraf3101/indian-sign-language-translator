@@ -453,3 +453,4 @@ with st.expander("Deployment diagnostics"):
     st.write("MediaPipe available:", MP_AVAILABLE)
     st.write("Text-to-sign import successful:", text_to_sign_sequence is not None)
     st.write("Model module import successful:", ISLConvNet is not None)
+
