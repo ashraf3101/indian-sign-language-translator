@@ -61,11 +61,21 @@ TOTAL_LANDMARK_FEATURES = 126
 preprocess_error = None
 
 try:
-    from src.preprocess import (
-        extract_landmarks,
-        TOTAL_LANDMARK_FEATURES,
-        MP_AVAILABLE,
-    )
+    # Support both layouts: src/preprocess.py or preprocess.py beside app.py.
+    try:
+        from src.preprocess import (
+            extract_landmarks,
+            TOTAL_LANDMARK_FEATURES,
+            MP_AVAILABLE,
+        )
+    except ModuleNotFoundError as import_exc:
+        if import_exc.name != "src":
+            raise
+        from preprocess import (
+            extract_landmarks,
+            TOTAL_LANDMARK_FEATURES,
+            MP_AVAILABLE,
+        )
 except Exception as exc:
     preprocess_error = f"{type(exc).__name__}: {exc}"
 
@@ -110,8 +120,8 @@ def load_saved_model(model_file: str, encoder_file: str):
         model = pickle.load(f)
     with open(encoder_file, "rb") as f:
         encoder = pickle.load(f)
-    if not hasattr(model, "predict_proba"):
-        raise TypeError("Saved model does not provide predict_proba().")
+    if not callable(getattr(model, "predict", None)):
+        raise TypeError("Saved model does not provide a usable predict() method.")
     if not hasattr(encoder, "classes_"):
         raise TypeError("Saved label encoder does not provide classes_.")
     return model, encoder
@@ -268,8 +278,8 @@ with tab1:
                     features, annotated_bgr, hands_count = extract_landmarks(
                         bgr, draw_landmarks=True
                     )
-                    if features is None:
-                        st.warning("No hand landmarks were detected. Try a clearer image.")
+                    if features is None or hands_count == 0:
+                        st.warning("No hand landmarks were detected. Try a clearer image with your hand fully visible.")
                     else:
                         features = np.asarray(features, dtype=np.float32).reshape(1, -1)
                         expected = getattr(model, "n_features_in_", features.shape[1])
@@ -285,22 +295,46 @@ with tab1:
                                     caption=f"Detected hands: {hands_count}",
                                     use_container_width=True,
                                 )
-                            probs = model.predict_proba(features)[0]
-                            top_idx = int(np.argmax(probs))
-                            confidence = float(probs[top_idx])
-                            prediction = classes[top_idx] if top_idx < len(classes) else str(top_idx)
+
+                            # Predict works for classifiers that do not expose predict_proba().
+                            raw_prediction = model.predict(features)[0]
+                            model_classes = getattr(model, "classes_", None)
+                            prediction = raw_prediction
+                            # Integer predictions are commonly label-encoded class IDs.
+                            if isinstance(raw_prediction, (int, np.integer)):
+                                try:
+                                    prediction = label_encoder.inverse_transform([int(raw_prediction)])[0]
+                                except Exception:
+                                    prediction = raw_prediction
+                            prediction = str(prediction)
+
                             st.markdown(
                                 f'<div class="pred-box"><div class="pred-label">'
-                                f'{html.escape(str(prediction))}</div>'
-                                f'<div>Confidence: <b>{confidence * 100:.1f}%</b></div></div>',
+                                f'{html.escape(prediction)}</div></div>',
                                 unsafe_allow_html=True,
                             )
-                            st.progress(float(np.clip(confidence, 0, 1)))
-                            st.session_state.last_predicted = str(prediction)
-                            st.markdown("**Top predictions**")
-                            for rank, idx in enumerate(np.argsort(probs)[-3:][::-1], start=1):
-                                name = classes[idx] if idx < len(classes) else str(idx)
-                                st.write(f"{rank}. **{name}** — {probs[idx] * 100:.1f}%")
+                            st.session_state.last_predicted = prediction
+
+                            if callable(getattr(model, "predict_proba", None)):
+                                probs = np.asarray(model.predict_proba(features)[0], dtype=float)
+                                confidence_idx = int(np.argmax(probs))
+                                confidence = float(probs[confidence_idx])
+                                st.markdown(f"**Confidence:** {confidence * 100:.1f}%")
+                                st.progress(float(np.clip(confidence, 0, 1)))
+                                st.markdown("**Top predictions**")
+                                top_indices = np.argsort(probs)[-3:][::-1]
+                                for rank, idx in enumerate(top_indices, start=1):
+                                    class_value = model_classes[int(idx)] if model_classes is not None and int(idx) < len(model_classes) else int(idx)
+                                    if isinstance(class_value, (int, np.integer)):
+                                        try:
+                                            name = label_encoder.inverse_transform([int(class_value)])[0]
+                                        except Exception:
+                                            name = class_value
+                                    else:
+                                        name = class_value
+                                    st.write(f"{rank}. **{name}** — {probs[int(idx)] * 100:.1f}%")
+                            else:
+                                st.info("Prediction completed. This saved model does not provide probability-based confidence scores.")
                 except Exception as exc:
                     st.error("Prediction failed. Check the preprocessing/model compatibility.")
                     st.exception(exc)
