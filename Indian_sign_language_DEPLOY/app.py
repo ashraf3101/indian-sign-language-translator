@@ -114,56 +114,94 @@ if "model_error" not in st.session_state:
     st.session_state.model_error = None
 
 
+def _rebuild_model_from_dict(payload):
+    """Rebuild this project's NumPy ISLConvNet from a recognized saved dictionary."""
+    if not isinstance(payload, dict):
+        return payload
+
+    # Some checkpoints wrap the actual estimator in a dictionary.
+    for key in ("model", "estimator", "classifier", "network", "model_object"):
+        candidate = payload.get(key)
+        if callable(getattr(candidate, "predict", None)):
+            return candidate
+
+    if ISLConvNet is None:
+        raise TypeError(
+            "The saved model is a dictionary, and src.train_model.ISLConvNet "
+            "could not be imported. Check the Model module import details."
+        )
+
+    # Accept either a plain weights dictionary or a common nested weights key.
+    weights = payload
+    for key in ("state_dict", "model_state_dict", "weights", "parameters", "state"):
+        if isinstance(payload.get(key), dict):
+            weights = payload[key]
+            break
+
+    aliases = {
+        "W_conv1": ("W_conv1", "conv1.weight", "conv1_weight"),
+        "b_conv1": ("b_conv1", "conv1.bias", "conv1_bias"),
+        "W_conv2": ("W_conv2", "conv2.weight", "conv2_weight"),
+        "b_conv2": ("b_conv2", "conv2.bias", "conv2_bias"),
+        "W_dense1": ("W_dense1", "dense1.weight", "dense1_weight"),
+        "b_dense1": ("b_dense1", "dense1.bias", "dense1_bias"),
+        "W_out": ("W_out", "out.weight", "output.weight", "W_output"),
+        "b_out": ("b_out", "out.bias", "output.bias", "b_output"),
+    }
+    required = ("W_conv1", "b_conv1", "W_conv2", "b_conv2", "W_dense1", "b_dense1", "W_out", "b_out")
+    restored = {}
+    for target, possible_names in aliases.items():
+        for name in possible_names:
+            if name in weights:
+                restored[target] = np.asarray(weights[name], dtype=np.float32)
+                break
+
+    if all(name in restored for name in required):
+        num_classes = int(restored["W_out"].shape[-1])
+        model = ISLConvNet(num_classes=num_classes)
+        for name in required:
+            setattr(model, name, restored[name])
+        model.is_fitted = True
+        return model
+
+    keys = list(payload.keys())
+    nested_keys = list(weights.keys()) if isinstance(weights, dict) else []
+    raise TypeError(
+        "models/isl_model.pkl loaded as a dictionary, not a model object, and "
+        "it does not contain the recognized ISLConvNet weight keys. "
+        f"Top-level keys: {keys!r}. Weight keys checked: {nested_keys[:40]!r}. "
+        "The model file must be recreated from src/train_model.py or saved in a "
+        "supported format."
+    )
+
+
 @st.cache_resource(show_spinner=False)
 def load_saved_model(model_file: str, encoder_file: str):
-    """Load the committed model and encoder, with compatibility for old pickles."""
-    # Some versions of the training script may have pickled the custom class as
-    # __main__.ISLConvNet. Make that class available before unpickling.
+    """Load model and encoder; restore a recognized dictionary checkpoint if possible."""
+    # Pickle may refer to a class stored under __main__ in an earlier training run.
     if ISLConvNet is not None:
         setattr(sys.modules["__main__"], "ISLConvNet", ISLConvNet)
 
     with open(model_file, "rb") as f:
-        model = pickle.load(f)
+        saved_model = pickle.load(f)
     with open(encoder_file, "rb") as f:
         encoder = pickle.load(f)
 
-    # Restore methods if this is an older instance of our custom network whose
-    # class was pickled from a different module path. Only do this when the
-    # expected network weights are present; never rebind an arbitrary object.
-    required_weights = (
-        "W_conv1", "b_conv1", "W_conv2", "b_conv2",
-        "W_dense1", "b_dense1", "W_out", "b_out",
-    )
-    if not callable(getattr(model, "predict", None)) and ISLConvNet is not None:
-        if all(hasattr(model, attr) for attr in required_weights):
-            try:
-                model.__class__ = ISLConvNet
-            except (TypeError, AttributeError):
-                pass
+    model = _rebuild_model_from_dict(saved_model)
 
     if not callable(getattr(model, "predict", None)):
-        model_type = f"{type(model).__module__}.{type(model).__name__}"
-        available = [
-            name for name in ("predict", "predict_proba", "fit", "forward")
-            if callable(getattr(model, name, None))
-        ]
         raise TypeError(
-            f"Saved model type is {model_type} and has no usable predict() method. "
-            f"Detected methods: {available or 'none'}. The model file may be from "
-            "a different/older training version; regenerate both model files from "
-            "the current src/train_model.py and commit them together."
+            f"Loaded object {type(model).__module__}.{type(model).__name__} "
+            "does not provide a usable predict() method."
         )
-
     if not hasattr(encoder, "classes_"):
         raise TypeError("Saved label encoder does not provide classes_.")
 
-    # Custom ISLConvNet predicts integer class indices and has no classes_ field.
-    # Ensure the encoder and model output sizes are compatible where detectable.
     model_class_count = getattr(model, "num_classes", None)
     if model_class_count is not None and int(model_class_count) != len(encoder.classes_):
         raise ValueError(
-            f"Model has {model_class_count} output classes, but label encoder has "
-            f"{len(encoder.classes_)} classes. Replace both saved files from the same training run."
+            f"Model has {model_class_count} output classes but the label encoder has "
+            f"{len(encoder.classes_)} classes. Replace both files from the same training run."
         )
     return model, encoder
 
