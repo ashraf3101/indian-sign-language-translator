@@ -7,6 +7,7 @@ from pathlib import Path
 import json
 import pickle
 import html
+import sys
 import numpy as np
 import streamlit as st
 from PIL import Image
@@ -115,15 +116,55 @@ if "model_error" not in st.session_state:
 
 @st.cache_resource(show_spinner=False)
 def load_saved_model(model_file: str, encoder_file: str):
-    """Load only committed model artifacts. Never train during page startup."""
+    """Load the committed model and encoder, with compatibility for old pickles."""
+    # Some versions of the training script may have pickled the custom class as
+    # __main__.ISLConvNet. Make that class available before unpickling.
+    if ISLConvNet is not None:
+        setattr(sys.modules["__main__"], "ISLConvNet", ISLConvNet)
+
     with open(model_file, "rb") as f:
         model = pickle.load(f)
     with open(encoder_file, "rb") as f:
         encoder = pickle.load(f)
+
+    # Restore methods if this is an older instance of our custom network whose
+    # class was pickled from a different module path. Only do this when the
+    # expected network weights are present; never rebind an arbitrary object.
+    required_weights = (
+        "W_conv1", "b_conv1", "W_conv2", "b_conv2",
+        "W_dense1", "b_dense1", "W_out", "b_out",
+    )
+    if not callable(getattr(model, "predict", None)) and ISLConvNet is not None:
+        if all(hasattr(model, attr) for attr in required_weights):
+            try:
+                model.__class__ = ISLConvNet
+            except (TypeError, AttributeError):
+                pass
+
     if not callable(getattr(model, "predict", None)):
-        raise TypeError("Saved model does not provide a usable predict() method.")
+        model_type = f"{type(model).__module__}.{type(model).__name__}"
+        available = [
+            name for name in ("predict", "predict_proba", "fit", "forward")
+            if callable(getattr(model, name, None))
+        ]
+        raise TypeError(
+            f"Saved model type is {model_type} and has no usable predict() method. "
+            f"Detected methods: {available or 'none'}. The model file may be from "
+            "a different/older training version; regenerate both model files from "
+            "the current src/train_model.py and commit them together."
+        )
+
     if not hasattr(encoder, "classes_"):
         raise TypeError("Saved label encoder does not provide classes_.")
+
+    # Custom ISLConvNet predicts integer class indices and has no classes_ field.
+    # Ensure the encoder and model output sizes are compatible where detectable.
+    model_class_count = getattr(model, "num_classes", None)
+    if model_class_count is not None and int(model_class_count) != len(encoder.classes_):
+        raise ValueError(
+            f"Model has {model_class_count} output classes, but label encoder has "
+            f"{len(encoder.classes_)} classes. Replace both saved files from the same training run."
+        )
     return model, encoder
 
 
@@ -296,45 +337,52 @@ with tab1:
                                     use_container_width=True,
                                 )
 
-                            # Predict works for classifiers that do not expose predict_proba().
-                            raw_prediction = model.predict(features)[0]
+                            # Our custom ISLConvNet returns encoded integer class IDs.
+                            raw_prediction = np.asarray(model.predict(features)).reshape(-1)[0]
                             model_classes = getattr(model, "classes_", None)
-                            prediction = raw_prediction
-                            # Integer predictions are commonly label-encoded class IDs.
+
                             if isinstance(raw_prediction, (int, np.integer)):
-                                try:
-                                    prediction = label_encoder.inverse_transform([int(raw_prediction)])[0]
-                                except Exception:
-                                    prediction = raw_prediction
-                            prediction = str(prediction)
+                                raw_index = int(raw_prediction)
+                                # For this project's custom network, predictions are
+                                # indices into LabelEncoder.classes_.
+                                if 0 <= raw_index < len(label_encoder.classes_):
+                                    prediction = label_encoder.inverse_transform([raw_index])[0]
+                                else:
+                                    prediction = str(raw_index)
+                            else:
+                                prediction = str(raw_prediction)
 
                             st.markdown(
                                 f'<div class="pred-box"><div class="pred-label">'
-                                f'{html.escape(prediction)}</div></div>',
+                                f'{html.escape(str(prediction))}</div></div>',
                                 unsafe_allow_html=True,
                             )
-                            st.session_state.last_predicted = prediction
+                            st.session_state.last_predicted = str(prediction)
 
                             if callable(getattr(model, "predict_proba", None)):
                                 probs = np.asarray(model.predict_proba(features)[0], dtype=float)
-                                confidence_idx = int(np.argmax(probs))
-                                confidence = float(probs[confidence_idx])
-                                st.markdown(f"**Confidence:** {confidence * 100:.1f}%")
-                                st.progress(float(np.clip(confidence, 0, 1)))
-                                st.markdown("**Top predictions**")
-                                top_indices = np.argsort(probs)[-3:][::-1]
-                                for rank, idx in enumerate(top_indices, start=1):
-                                    class_value = model_classes[int(idx)] if model_classes is not None and int(idx) < len(model_classes) else int(idx)
-                                    if isinstance(class_value, (int, np.integer)):
-                                        try:
-                                            name = label_encoder.inverse_transform([int(class_value)])[0]
-                                        except Exception:
-                                            name = class_value
-                                    else:
-                                        name = class_value
-                                    st.write(f"{rank}. **{name}** — {probs[int(idx)] * 100:.1f}%")
+                                if probs.size:
+                                    confidence_idx = int(np.argmax(probs))
+                                    confidence = float(probs[confidence_idx])
+                                    st.markdown(f"**Confidence:** {confidence * 100:.1f}%")
+                                    st.progress(float(np.clip(confidence, 0, 1)))
+                                    st.markdown("**Top predictions**")
+                                    top_indices = np.argsort(probs)[-3:][::-1]
+                                    for rank, idx in enumerate(top_indices, start=1):
+                                        if model_classes is not None and int(idx) < len(model_classes):
+                                            class_value = model_classes[int(idx)]
+                                            if isinstance(class_value, (int, np.integer)):
+                                                try:
+                                                    name = label_encoder.inverse_transform([int(class_value)])[0]
+                                                except Exception:
+                                                    name = class_value
+                                            else:
+                                                name = class_value
+                                        else:
+                                            name = label_encoder.classes_[int(idx)] if int(idx) < len(label_encoder.classes_) else str(idx)
+                                        st.write(f"{rank}. **{name}** — {probs[int(idx)] * 100:.1f}%")
                             else:
-                                st.info("Prediction completed. This saved model does not provide probability-based confidence scores.")
+                                st.info("Prediction completed. This model does not provide probability-based confidence scores.")
                 except Exception as exc:
                     st.error("Prediction failed. Check the preprocessing/model compatibility.")
                     st.exception(exc)
@@ -453,4 +501,3 @@ with st.expander("Deployment diagnostics"):
     st.write("MediaPipe available:", MP_AVAILABLE)
     st.write("Text-to-sign import successful:", text_to_sign_sequence is not None)
     st.write("Model module import successful:", ISLConvNet is not None)
-
